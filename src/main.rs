@@ -252,59 +252,75 @@ async fn get_comments(
 async fn create_board(
     Extension(pool): Extension<Arc<SqlitePool>>,
     Json(data): Json<CreateBoard>,
-) -> (StatusCode, Json<String>) {
+) -> (StatusCode, Json<Result<Board, String>>) {
     let Ok(data) = data.validate() else {
-        return (StatusCode::BAD_REQUEST, Json("invalid data".into()));
+        return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
-    let query = sqlx::query(
+    let res = sqlx::query_as!(Board,
         r#"
         INSERT INTO boards (code, name, desc, max_threads, max_replies, max_img_replies, max_sub_len, max_com_len, max_file_size, is_nsfw)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING *
         "#,
+        data.code,
+        data.name,
+        data.desc,
+        data.max_threads,
+        data.max_replies,
+        data.max_img_replies,
+        data.max_sub_len,
+        data.max_com_len,
+        data.max_file_size,
+        data.is_nsfw
     )
-    .bind(data.code)
-    .bind(data.name)
-    .bind(data.desc)
-    .bind(data.max_threads)
-    .bind(data.max_replies)
-    .bind(data.max_img_replies)
-    .bind(data.max_sub_len)
-    .bind(data.max_com_len)
-    .bind(data.max_file_size)
-    .bind(data.is_nsfw)
-    .execute(&*pool)
+
+
+    .fetch_one(&*pool)
     .await;
 
-    if let Err(e) = query {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(format!("Error: {}", e)),
-        );
+    match res {
+        Ok(res) => (StatusCode::CREATED, Json(Ok(res))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(Err(e.to_string()))),
     }
-
-    (StatusCode::OK, Json("success".into()))
 }
 async fn create_thread(
     Extension(pool): Extension<Arc<SqlitePool>>,
     multipart: Multipart,
-) -> (StatusCode, Json<String>) {
+) -> (StatusCode, Json<Result<Comment, String>>) {
     let Ok((thread, file_name, media_data)) = parse_multipart::<CreateThread>(multipart).await
     else {
         return (
             StatusCode::BAD_REQUEST,
-            Json("failed to process multipart".into()),
+            Json(Err("failed to process multipart".into())),
         );
     };
     let Ok(thread) = thread.validate() else {
-        return (StatusCode::BAD_REQUEST, Json("invalid data".into()));
+        return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
+
+    let has_board = sqlx::query_as!(
+        Board,
+        r#"
+        SELECT * FROM boards WHERE code = $1
+        "#,
+        thread.board,
+    )
+    .fetch_one(&*pool)
+    .await;
+    if has_board.is_err() {
+        return (StatusCode::NOT_FOUND, Json(Err("board not found".into())));
+    }
+
     let Some(media_data) = media_data else {
-        return (StatusCode::BAD_REQUEST, Json("image is required".into()));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(Err("image is required".into())),
+        );
     };
     let Ok((media_name, thumb_name)) = save_media(media_data).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json("failed to process media".into()),
+            Json(Err("failed to process media".into())),
         );
     };
 
@@ -324,66 +340,70 @@ async fn create_thread(
         None::<i64>,
     )
     .fetch_one(&*pool)
-    .await
-    .unwrap();
+    .await;
 
-    (StatusCode::OK, Json(res.id.to_string()))
+    match res {
+        Ok(res) => (StatusCode::OK, Json(Ok(res))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(Err(e.to_string()))),
+    }
 }
 async fn create_comment(
     Extension(pool): Extension<Arc<SqlitePool>>,
     multipart: Multipart,
-) -> (StatusCode, Json<String>) {
+) -> (StatusCode, Json<Result<Comment, String>>) {
     let Ok((comment, file_name, media_data)) = parse_multipart::<CreateComment>(multipart).await
     else {
         return (
             StatusCode::BAD_REQUEST,
-            Json("failed to process multipart".into()),
+            Json(Err("failed to process multipart".into())),
         );
     };
     let Ok(comment) = comment.validate() else {
-        return (StatusCode::BAD_REQUEST, Json("invalid data".into()));
+        return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
     let res = if let Some(media_data) = media_data {
         let Ok((media_name, thumb_name)) = save_media(media_data).await else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json("failed to process media".into()),
+                Json(Err("failed to process media".into())),
             );
         };
-        sqlx::query(
+        sqlx::query_as!(
+            Comment,
             r#"
-            INSERT INTO comments (file_name, media_name, thumb_name, com, op)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO comments (file_name, media_name, thumb_name, alias, com, op)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *
             "#,
+            file_name,
+            media_name,
+            thumb_name,
+            comment.alias,
+            comment.com,
+            comment.op,
         )
-        .bind(file_name)
-        .bind(media_name)
-        .bind(thumb_name)
-        .bind(comment.com)
-        .bind(comment.op)
-        .execute(&*pool)
+        .fetch_one(&*pool)
         .await
     } else {
-        sqlx::query(
+        sqlx::query_as!(
+            Comment,
             r#"
-            INSERT INTO comments (com, op)
-            VALUES ($1, $2)
+            INSERT INTO comments (alias, com, op)
+            VALUES ($1, $2, $3)
+            RETURNING *
             "#,
+            comment.alias,
+            comment.com,
+            comment.op,
         )
-        .bind(comment.com)
-        .bind(comment.op)
-        .execute(&*pool)
+        .fetch_one(&*pool)
         .await
     };
 
-    let Ok(_) = res else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json("failed to create comment".into()),
-        );
-    };
-
-    (StatusCode::OK, Json("success".into()))
+    match res {
+        Ok(res) => (StatusCode::OK, Json(Ok(res))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(Err(e.to_string()))),
+    }
 }
 
 async fn save_media(media_data: Vec<u8>) -> Result<(String, String), Box<dyn std::error::Error>> {
