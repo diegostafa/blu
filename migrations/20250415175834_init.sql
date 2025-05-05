@@ -10,7 +10,7 @@ CREATE TABLE boards (
     max_com_len INTEGER NOT NULL,
     max_sub_len INTEGER NOT NULL,
     max_file_size INTEGER NOT NULL,
-    created_at TEXT NOT NULL DEFAULT current_timestamp,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     is_nsfw BOOLEAN NOT NULL
 );
 DROP TABLE IF EXISTS comments;
@@ -24,7 +24,7 @@ CREATE TABLE comments (
     media_name TEXT,
     thumb_name TEXT,
     board TEXT,
-    created_at TEXT NOT NULL DEFAULT current_timestamp,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     FOREIGN KEY (board) REFERENCES boards (code),
     FOREIGN KEY (op) REFERENCES comments (id)
 );

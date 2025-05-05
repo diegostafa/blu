@@ -7,6 +7,8 @@ use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use html_escape::encode_text;
+use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -60,20 +62,7 @@ struct Board {
     max_com_len: i64,
     max_file_size: i64,
     is_nsfw: bool,
-    created_at: String,
-}
-#[derive(Serialize, Deserialize)]
-struct Comment {
-    id: i64,
-    alias: Option<String>,
-    file_name: Option<String>,
-    media_name: Option<String>,
-    thumb_name: Option<String>,
-    sub: Option<String>,
-    com: Option<String>,
-    op: Option<i64>,
-    board: Option<String>,
-    created_at: String,
+    created_at: i64,
 }
 #[derive(Serialize, Deserialize)]
 struct Thread {
@@ -87,6 +76,19 @@ struct Thread {
     board: Option<String>,
     replies: i64,
     images: i64,
+}
+#[derive(Serialize, Deserialize)]
+struct Comment {
+    id: i64,
+    alias: Option<String>,
+    file_name: Option<String>,
+    media_name: Option<String>,
+    thumb_name: Option<String>,
+    sub: Option<String>,
+    com: Option<String>,
+    op: Option<i64>,
+    board: Option<String>,
+    created_at: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +130,7 @@ impl CreateBoard {
 
 #[derive(Serialize, Deserialize)]
 struct CreateThread {
+    alias: Option<String>,
     sub: Option<String>,
     com: Option<String>,
     board: String,
@@ -140,14 +143,24 @@ impl CreateThread {
         if self.board.is_empty() {
             return Err("board is required".into());
         }
-        Ok(self)
+        if let Some(alias) = &self.alias {
+            if alias.len() > 100 {
+                return Err("alias is too long".into());
+            }
+        }
+        Ok(Self {
+            alias: self.alias,
+            sub: self.sub.map(encode_subject),
+            com: self.com.map(encode_comment),
+            board: self.board,
+        })
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct CreateComment {
     alias: Option<String>,
-    com: String,
+    com: Option<String>,
     op: i64,
 }
 impl CreateComment {
@@ -160,7 +173,11 @@ impl CreateComment {
                 return Err("alias is too long".into());
             }
         }
-        Ok(self)
+        Ok(Self {
+            alias: self.alias,
+            com: self.com.map(encode_comment),
+            op: self.op,
+        })
     }
 }
 
@@ -327,13 +344,14 @@ async fn create_thread(
     let res = sqlx::query_as!(
         Comment,
         r#"
-        INSERT INTO comments (file_name, media_name, thumb_name, sub, com, board, op)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO comments (file_name, media_name, thumb_name, alias, sub, com, board, op)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
         "#,
         file_name,
         media_name,
         thumb_name,
+        thread.alias,
         thread.sub,
         thread.com,
         thread.board,
@@ -361,6 +379,13 @@ async fn create_comment(
     let Ok(comment) = comment.validate() else {
         return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
+    if comment.com.is_none() && media_data.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(Err("comment or image is required".into())),
+        );
+    }
+
     let res = if let Some(media_data) = media_data {
         let Ok((media_name, thumb_name)) = save_media(media_data).await else {
             return (
@@ -463,4 +488,53 @@ async fn parse_multipart<T: DeserializeOwned>(
         return Err("invalid data".into());
     };
     Ok((val, file_name, media_data))
+}
+
+fn encode_comment(com: impl AsRef<str>) -> String {
+    let re_replies = Regex::new(r"&gt;&gt;(\d+)").unwrap();
+    let re_url = Regex::new(
+        r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
+    )
+    .unwrap();
+
+    let text = encode_text(&com);
+    let text = text
+        .lines()
+        .map(|ln| {
+            if ln.starts_with("&gt;") && !ln.starts_with("&gt;&gt;") {
+                format!("<span>{ln}</span>")
+            } else {
+                ln.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let text = re_url.replace_all(&text, "<a href=\"$0\">$0</a>");
+    let text = re_replies.replace_all(&text, "<a href=\"#p$1\">&gt;&gt;$1</a>");
+    text.to_string()
+}
+fn encode_subject(sub: impl AsRef<str>) -> String {
+    let sub = encode_comment(sub);
+    format!("<b>{sub}</b>")
+}
+
+#[test]
+fn test_encode() {
+    use crate::encode_comment;
+
+    assert_eq!(encode_comment("hello >world"), "hello &gt;world");
+    assert_eq!(encode_comment(">hello"), "<span>&gt;hello</span>");
+
+    assert_eq!(
+        encode_comment("https://google.com"),
+        "<a href=\"https://google.com\">https://google.com</a>"
+    );
+    assert_eq!(
+        encode_comment("hello >>11 >>22"),
+        "hello <a href=\"#p11\">&gt;&gt;11</a> <a href=\"#p22\">&gt;&gt;22</a>"
+    );
+    assert_eq!(
+        encode_comment("this\nis\nmultiline"),
+        "this<br>is<br>multiline"
+    );
 }
