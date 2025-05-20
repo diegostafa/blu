@@ -70,6 +70,8 @@ struct Thread {
     file_name: Option<String>,
     media_name: Option<String>,
     thumb_name: Option<String>,
+    media_size: Option<i64>,
+    thumb_size: Option<i64>,
     sub: Option<String>,
     com: Option<String>,
     op: Option<i64>,
@@ -84,6 +86,8 @@ struct Comment {
     file_name: Option<String>,
     media_name: Option<String>,
     thumb_name: Option<String>,
+    media_size: Option<i64>,
+    thumb_size: Option<i64>,
     sub: Option<String>,
     com: Option<String>,
     op: Option<i64>,
@@ -143,10 +147,10 @@ impl CreateThread {
         if self.board.is_empty() {
             return Err("board is required".into());
         }
-        if let Some(alias) = &self.alias {
-            if alias.len() > 100 {
-                return Err("alias is too long".into());
-            }
+        if let Some(alias) = &self.alias
+            && alias.len() > 100
+        {
+            return Err("alias is too long".into());
         }
         Ok(Self {
             alias: self.alias,
@@ -168,10 +172,10 @@ impl CreateComment {
         if self.op < 0 {
             return Err("op can't be negative".into());
         }
-        if let Some(alias) = &self.alias {
-            if alias.len() > 100 {
-                return Err("alias is too long".into());
-            }
+        if let Some(alias) = &self.alias
+            && alias.len() > 100
+        {
+            return Err("alias is too long".into());
         }
         Ok(Self {
             alias: self.alias,
@@ -182,7 +186,7 @@ impl CreateComment {
 }
 
 async fn get_media(Path(file): Path<String>) -> impl IntoResponse {
-    let Ok(mut file) = File::open(format!("./media/{}", file)).await else {
+    let Ok(mut file) = File::open(format!("./media/{file}")).await else {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
     };
     let mut data = Vec::new();
@@ -224,6 +228,8 @@ async fn get_threads(
         c.file_name AS file_name,
         c.media_name AS media_name,
         c.thumb_name AS thumb_name,
+        c.media_size AS media_size,
+        c.thumb_size AS thumb_size,
         c.sub AS sub,
         c.com AS com,
         c.op AS op,
@@ -334,7 +340,7 @@ async fn create_thread(
             Json(Err("image is required".into())),
         );
     };
-    let Ok((media_name, thumb_name)) = save_media(media_data).await else {
+    let Ok((media_name, thumb_name, media_size, thumb_size)) = save_media(media_data).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(Err("failed to process media".into())),
@@ -344,13 +350,15 @@ async fn create_thread(
     let res = sqlx::query_as!(
         Comment,
         r#"
-        INSERT INTO comments (file_name, media_name, thumb_name, alias, sub, com, board, op)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, alias, sub, com, board, op)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *
         "#,
         file_name,
         media_name,
         thumb_name,
+        media_size,
+        thumb_size,
         thread.alias,
         thread.sub,
         thread.com,
@@ -387,7 +395,8 @@ async fn create_comment(
     }
 
     let res = if let Some(media_data) = media_data {
-        let Ok((media_name, thumb_name)) = save_media(media_data).await else {
+        let Ok((media_name, thumb_name, media_size, thumb_size)) = save_media(media_data).await
+        else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(Err("failed to process media".into())),
@@ -396,13 +405,15 @@ async fn create_comment(
         sqlx::query_as!(
             Comment,
             r#"
-            INSERT INTO comments (file_name, media_name, thumb_name, alias, com, op)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, alias, com, op)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
             "#,
             file_name,
             media_name,
             thumb_name,
+            media_size,
+            thumb_size,
             comment.alias,
             comment.com,
             comment.op,
@@ -431,7 +442,9 @@ async fn create_comment(
     }
 }
 
-async fn save_media(media_data: Vec<u8>) -> Result<(String, String), Box<dyn std::error::Error>> {
+async fn save_media(
+    media_data: Vec<u8>,
+) -> Result<(String, String, i64, i64), Box<dyn std::error::Error>> {
     let uuid = Uuid::new_v4().to_string();
     let media_kind = infer::get(&media_data).ok_or("Failed to infer media type")?;
     let media_name = format!("{uuid}.{}", media_kind.extension());
@@ -446,6 +459,8 @@ async fn save_media(media_data: Vec<u8>) -> Result<(String, String), Box<dyn std
     .pop()
     .ok_or("Failed to create thumbnails")?;
     thumb.write_jpeg(&mut thumb_data, 100)?;
+    let media_size = media_data.len();
+    let thumb_size = thumb_data.get_ref().len();
 
     File::create(format!("media/{media_name}"))
         .await?
@@ -457,7 +472,7 @@ async fn save_media(media_data: Vec<u8>) -> Result<(String, String), Box<dyn std
         .write_all(thumb_data.get_ref())
         .await?;
 
-    Ok((media_name, thumb_name))
+    Ok((media_name, thumb_name, media_size as i64, thumb_size as i64))
 }
 async fn parse_multipart<T: DeserializeOwned>(
     mut multipart: Multipart,

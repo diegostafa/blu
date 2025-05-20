@@ -23,6 +23,8 @@ CREATE TABLE comments (
     file_name TEXT,
     media_name TEXT,
     thumb_name TEXT,
+    media_size INTEGER,
+    thumb_size INTEGER,
     board TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     FOREIGN KEY (board) REFERENCES boards (code),
