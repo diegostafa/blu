@@ -69,8 +69,9 @@ struct Thread {
     id: i64,
     file_name: Option<String>,
     media_name: Option<String>,
-    thumb_name: Option<String>,
     media_size: Option<i64>,
+    media_ext: Option<String>,
+    thumb_name: Option<String>,
     thumb_size: Option<i64>,
     sub: Option<String>,
     com: Option<String>,
@@ -85,8 +86,9 @@ struct Comment {
     alias: Option<String>,
     file_name: Option<String>,
     media_name: Option<String>,
-    thumb_name: Option<String>,
     media_size: Option<i64>,
+    media_ext: Option<String>,
+    thumb_name: Option<String>,
     thumb_size: Option<i64>,
     sub: Option<String>,
     com: Option<String>,
@@ -185,6 +187,19 @@ impl CreateComment {
     }
 }
 
+struct MediaInfo {
+    media_name: String,
+    media_size: i64,
+    media_ext: String,
+    thumb_name: String,
+    thumb_size: i64,
+}
+struct MultiPartData<T> {
+    data: T,
+    file_name: Option<String>,
+    file_bytes: Option<Vec<u8>>,
+}
+
 async fn get_media(Path(file): Path<String>) -> impl IntoResponse {
     let Ok(mut file) = File::open(format!("./media/{file}")).await else {
         return (StatusCode::NOT_FOUND, "file not found").into_response();
@@ -230,6 +245,7 @@ async fn get_threads(
         c.thumb_name AS thumb_name,
         c.media_size AS media_size,
         c.thumb_size AS thumb_size,
+        c.media_ext AS media_ext,
         c.sub AS sub,
         c.com AS com,
         c.op AS op,
@@ -310,14 +326,19 @@ async fn create_thread(
     Extension(pool): Extension<Arc<SqlitePool>>,
     multipart: Multipart,
 ) -> (StatusCode, Json<Result<Comment, String>>) {
-    let Ok((thread, file_name, media_data)) = parse_multipart::<CreateThread>(multipart).await
+    let Ok(MultiPartData {
+        data,
+        file_name,
+        file_bytes,
+    }) = parse_multipart::<CreateThread>(multipart).await
     else {
         return (
             StatusCode::BAD_REQUEST,
             Json(Err("failed to process multipart".into())),
         );
     };
-    let Ok(thread) = thread.validate() else {
+
+    let Ok(thread) = data.validate() else {
         return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
 
@@ -334,13 +355,20 @@ async fn create_thread(
         return (StatusCode::NOT_FOUND, Json(Err("board not found".into())));
     }
 
-    let Some(media_data) = media_data else {
+    let Some(media_data) = file_bytes else {
         return (
             StatusCode::BAD_REQUEST,
             Json(Err("image is required".into())),
         );
     };
-    let Ok((media_name, thumb_name, media_size, thumb_size)) = save_media(media_data).await else {
+    let Ok(MediaInfo {
+        media_name,
+        media_size,
+        media_ext,
+        thumb_name,
+        thumb_size,
+    }) = save_media(media_data).await
+    else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(Err("failed to process media".into())),
@@ -350,8 +378,8 @@ async fn create_thread(
     let res = sqlx::query_as!(
         Comment,
         r#"
-        INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, alias, sub, com, board, op)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, alias, sub, com, board, op)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING *
         "#,
         file_name,
@@ -359,6 +387,7 @@ async fn create_thread(
         thumb_name,
         media_size,
         thumb_size,
+        media_ext,
         thread.alias,
         thread.sub,
         thread.com,
@@ -377,25 +406,36 @@ async fn create_comment(
     Extension(pool): Extension<Arc<SqlitePool>>,
     multipart: Multipart,
 ) -> (StatusCode, Json<Result<Comment, String>>) {
-    let Ok((comment, file_name, media_data)) = parse_multipart::<CreateComment>(multipart).await
+    let Ok(MultiPartData {
+        data,
+        file_name,
+        file_bytes,
+    }) = parse_multipart::<CreateComment>(multipart).await
     else {
         return (
             StatusCode::BAD_REQUEST,
             Json(Err("failed to process multipart".into())),
         );
     };
-    let Ok(comment) = comment.validate() else {
+
+    let Ok(comment) = data.validate() else {
         return (StatusCode::BAD_REQUEST, Json(Err("invalid data".into())));
     };
-    if comment.com.is_none() && media_data.is_none() {
+    if comment.com.is_none() && file_bytes.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(Err("comment or image is required".into())),
         );
     }
 
-    let res = if let Some(media_data) = media_data {
-        let Ok((media_name, thumb_name, media_size, thumb_size)) = save_media(media_data).await
+    let res = if let Some(media_data) = file_bytes {
+        let Ok(MediaInfo {
+            media_name,
+            media_size,
+            media_ext,
+            thumb_name,
+            thumb_size,
+        }) = save_media(media_data).await
         else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -405,8 +445,8 @@ async fn create_comment(
         sqlx::query_as!(
             Comment,
             r#"
-            INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, alias, com, op)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, alias, com, op)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
             file_name,
@@ -414,6 +454,7 @@ async fn create_comment(
             thumb_name,
             media_size,
             thumb_size,
+            media_ext,
             comment.alias,
             comment.com,
             comment.op,
@@ -442,13 +483,54 @@ async fn create_comment(
     }
 }
 
-async fn save_media(
-    media_data: Vec<u8>,
-) -> Result<(String, String, i64, i64), Box<dyn std::error::Error>> {
+async fn parse_multipart<T: DeserializeOwned>(
+    mut multipart: Multipart,
+) -> Result<MultiPartData<T>, Box<dyn std::error::Error>> {
+    let mut data: Option<T> = None;
+    let mut file_name: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+
+    while let Some(mut field) = multipart.next_field().await.unwrap() {
+        match field.name() {
+            Some("data") => {
+                let text = field.text().await?;
+                data = Some(serde_json::from_str(&text)?);
+            }
+            Some("media") => {
+                let Some(file) = field.file_name() else {
+                    return Err("file namenot found".into());
+                };
+                file_name = Some(
+                    std::path::Path::new(file)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(file)
+                        .to_string(),
+                );
+                let mut chunks = Vec::new();
+                while let Ok(Some(chunk)) = field.chunk().await {
+                    chunks.extend(chunk.to_vec());
+                }
+                file_bytes = Some(chunks);
+            }
+            _ => {}
+        }
+    }
+
+    let Some(data) = data else {
+        return Err("invalid data".into());
+    };
+    Ok(MultiPartData {
+        data,
+        file_name,
+        file_bytes,
+    })
+}
+async fn save_media(media_data: Vec<u8>) -> Result<MediaInfo, Box<dyn std::error::Error>> {
     let uuid = Uuid::new_v4().to_string();
     let media_kind = infer::get(&media_data).ok_or("Failed to infer media type")?;
-    let media_name = format!("{uuid}.{}", media_kind.extension());
-    let thumb_name = format!("{uuid}t.jpg");
+    let media_name = uuid.clone();
+    let thumb_name = format!("{uuid}t");
 
     let mut thumb_data = Cursor::new(Vec::new());
     let thumb = create_thumbnails(
@@ -459,8 +541,9 @@ async fn save_media(
     .pop()
     .ok_or("Failed to create thumbnails")?;
     thumb.write_jpeg(&mut thumb_data, 100)?;
-    let media_size = media_data.len();
-    let thumb_size = thumb_data.get_ref().len();
+    let media_size = media_data.len() as i64;
+    let thumb_size = thumb_data.get_ref().len() as i64;
+    let media_ext = media_kind.extension().to_string();
 
     File::create(format!("media/{media_name}"))
         .await?
@@ -472,37 +555,13 @@ async fn save_media(
         .write_all(thumb_data.get_ref())
         .await?;
 
-    Ok((media_name, thumb_name, media_size as i64, thumb_size as i64))
-}
-async fn parse_multipart<T: DeserializeOwned>(
-    mut multipart: Multipart,
-) -> Result<(T, Option<String>, Option<Vec<u8>>), Box<dyn std::error::Error>> {
-    let mut val: Option<T> = None;
-    let mut file_name: Option<String> = None;
-    let mut media_data: Option<Vec<u8>> = None;
-
-    while let Some(mut field) = multipart.next_field().await.unwrap() {
-        match field.name() {
-            Some("data") => {
-                let text = field.text().await?;
-                val = Some(serde_json::from_str(&text)?);
-            }
-            Some("media") => {
-                file_name = Some(field.file_name().unwrap().to_string());
-                let mut chunks = Vec::new();
-                while let Ok(Some(chunk)) = field.chunk().await {
-                    chunks.extend(chunk.to_vec());
-                }
-                media_data = Some(chunks);
-            }
-            _ => {}
-        }
-    }
-
-    let Some(val) = val else {
-        return Err("invalid data".into());
-    };
-    Ok((val, file_name, media_data))
+    Ok(MediaInfo {
+        media_name,
+        media_size,
+        media_ext,
+        thumb_name,
+        thumb_size,
+    })
 }
 
 fn encode_comment(com: impl AsRef<str>) -> String {
