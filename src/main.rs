@@ -19,20 +19,22 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+use validator::{Validate, ValidationError};
+
+type Res<T> = Result<T, Box<dyn Error>>;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Res<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db_url = std::env::var("DATABASE_URL")?;
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect(&db_url)
-        .await
-        .unwrap();
+        .await?;
     let pool = Arc::new(pool);
 
     let app = Router::new()
@@ -47,11 +49,9 @@ async fn main() {
         .layer(Extension(pool.clone()))
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    axum::serve(listener, app).await.map_err(|e| e.into())
 }
-
-type Res<T> = Result<T, Box<dyn Error>>;
 
 #[derive(Serialize, Deserialize)]
 struct Board {
@@ -102,98 +102,75 @@ struct Comment {
     created_at: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Validate)]
 struct CreateBoard {
+    #[validate(length(min = 1, max = 5), custom(function = "is_whitespace_empty"))]
     code: String,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     name: String,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     desc: String,
+
+    #[validate(range(min = 0))]
     max_threads: i64,
+
+    #[validate(range(min = 0))]
     max_replies: i64,
+
+    #[validate(range(min = 0))]
     max_img_replies: i64,
+
+    #[validate(range(min = 0))]
     max_sub_len: i64,
+
+    #[validate(range(min = 0))]
     max_com_len: i64,
+
+    #[validate(range(min = 0))]
     max_file_size: i64,
+
     is_nsfw: bool,
 }
-impl CreateBoard {
-    fn validate(self) -> Res<Self> {
-        if self.code.is_empty() || self.code.len() > 5 {
-            return Err("invalid board code".into());
-        }
-        if self.name.is_empty() || self.name.len() > 100 {
-            return Err("invalid board name".into());
-        }
-        if self.desc.is_empty() || self.desc.len() > 100 {
-            return Err("invalid board description".into());
-        }
-        if self.max_threads < 0 {
-            return Err("max_threads can't be negative".into());
-        }
-        if self.max_replies < 0 {
-            return Err("max_replies can't be negative".into());
-        }
-        if self.max_img_replies < 0 {
-            return Err("max_img_replies can't be negative".into());
-        }
-        Ok(self)
-    }
-}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Validate)]
 struct CreateThread {
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     alias: Option<String>,
+
+    #[validate(length(min = 1), custom(function = "is_whitespace_empty"))]
     sub: Option<String>,
+
+    #[validate(length(min = 1), custom(function = "is_whitespace_empty"))]
     com: Option<String>,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     media_desc: Option<String>,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
+    file_name: Option<String>,
+
+    #[validate(length(min = 1, max = 5), custom(function = "is_whitespace_empty"))]
     board: String,
 }
-impl CreateThread {
-    fn validate(self) -> Res<Self> {
-        if self.sub.is_none() && self.com.is_none() {
-            return Err("sub or com is required".into());
-        }
-        if self.board.is_empty() {
-            return Err("board is required".into());
-        }
-        if let Some(alias) = &self.alias
-            && alias.len() > 100
-        {
-            return Err("alias is too long".into());
-        }
-        Ok(Self {
-            alias: self.alias,
-            sub: self.sub.map(encode_subject),
-            com: self.com.map(encode_comment),
-            board: self.board,
-            media_desc: self.media_desc,
-        })
-    }
-}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Validate)]
 struct CreateComment {
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     alias: Option<String>,
+
+    #[validate(length(min = 1), custom(function = "is_whitespace_empty"))]
     com: Option<String>,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     media_desc: Option<String>,
+
+    #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
+    file_name: Option<String>,
+
+    #[validate(range(min = 0))]
     op: i64,
-}
-impl CreateComment {
-    fn validate(self) -> Res<Self> {
-        if self.op < 0 {
-            return Err("op can't be negative".into());
-        }
-        if let Some(alias) = &self.alias
-            && alias.len() > 100
-        {
-            return Err("alias is too long".into());
-        }
-        Ok(Self {
-            alias: self.alias,
-            com: self.com.map(encode_comment),
-            op: self.op,
-            media_desc: self.media_desc,
-        })
-    }
 }
 
 struct MediaInfo {
@@ -204,9 +181,8 @@ struct MediaInfo {
     thumb_size: i64,
 }
 struct MultiPartData<T> {
-    data: T,
-    file_name: Option<String>,
-    file_bytes: Option<Vec<u8>>,
+    form: T,
+    file: Option<Vec<u8>>,
 }
 
 async fn get_media(Path(file): Path<String>) -> impl IntoResponse {
@@ -290,7 +266,7 @@ async fn get_comments(
         sqlx::query_as!(
             Comment,
             r#"
-            SELECT * FROM comments WHERE board = $1 AND id = $2 OR op = $2
+            SELECT * FROM comments WHERE board = $1 AND (id = $2 OR op = $2)
             "#,
             board_id,
             thread_id,
@@ -306,26 +282,26 @@ async fn get_comments(
 }
 async fn create_board(
     Extension(pool): Extension<Arc<SqlitePool>>,
-    Json(data): Json<CreateBoard>,
+    Json(form): Json<CreateBoard>,
 ) -> impl IntoResponse {
     let create_board_impl = async || -> Res<Board> {
-        let data = data.validate()?;
+        form.validate()?;
         sqlx::query_as!(Board,
             r#"
             INSERT INTO boards (code, name, desc, max_threads, max_replies, max_img_replies, max_sub_len, max_com_len, max_file_size, is_nsfw)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             "#,
-            data.code,
-            data.name,
-            data.desc,
-            data.max_threads,
-            data.max_replies,
-            data.max_img_replies,
-            data.max_sub_len,
-            data.max_com_len,
-            data.max_file_size,
-            data.is_nsfw
+            form.code,
+            form.name,
+            form.desc,
+            form.max_threads,
+            form.max_replies,
+            form.max_img_replies,
+            form.max_sub_len,
+            form.max_com_len,
+            form.max_file_size,
+            form.is_nsfw
         )
         .fetch_one(&*pool)
         .await.map_err(|e| e.into())
@@ -341,23 +317,20 @@ async fn create_thread(
     multipart: Multipart,
 ) -> impl IntoResponse {
     let create_thread_impl = async || -> Res<Comment> {
-        let MultiPartData {
-            data,
-            file_name,
-            file_bytes,
-        } = parse_multipart::<CreateThread>(multipart).await?;
-        let thread = data.validate()?;
+        let MultiPartData { mut form, file } = parse_multipart::<CreateThread>(multipart).await?;
+        form.validate()?;
+        if form.sub.is_none() && form.com.is_none() {
+            return Err("subject or comment is required".into());
+        }
+        form.sub = form.sub.map(encode_subject);
+        form.com = form.com.map(encode_comment);
 
-        sqlx::query_as!(
-            Board,
-            r#"SELECT * FROM boards WHERE code = $1"#,
-            thread.board,
-        )
-        .fetch_one(&*pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        sqlx::query_as!(Board, r#"SELECT * FROM boards WHERE code = $1"#, form.board,)
+            .fetch_one(&*pool)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let media_data = file_bytes.ok_or("image is required")?;
+        let media_data = file.ok_or("media is required")?;
         let MediaInfo {
             media_name,
             media_size,
@@ -365,7 +338,6 @@ async fn create_thread(
             thumb_name,
             thumb_size,
         } = save_media(media_data).await?;
-
         sqlx::query_as!(
         Comment,
         r#"
@@ -373,17 +345,17 @@ async fn create_thread(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING *
         "#,
-        file_name,
+        form.file_name,
         media_name,
         thumb_name,
         media_size,
         thumb_size,
         media_ext,
-        thread.media_desc,
-        thread.alias,
-        thread.sub,
-        thread.com,
-        thread.board,
+        form.media_desc,
+        form.alias,
+        form.sub,
+        form.com,
+        form.board,
         None::<i64>,
     )
     .fetch_one(&*pool)
@@ -399,17 +371,14 @@ async fn create_comment(
     multipart: Multipart,
 ) -> impl IntoResponse {
     let create_comment_impl = async || -> Res<Comment> {
-        let MultiPartData {
-            data,
-            file_name,
-            file_bytes,
-        } = parse_multipart::<CreateComment>(multipart).await?;
-
-        let create_comment = data.validate()?;
-        if create_comment.com.is_none() && file_bytes.is_none() {
+        let MultiPartData { mut form, file } = parse_multipart::<CreateComment>(multipart).await?;
+        form.validate()?;
+        if form.com.is_none() && file.is_none() {
             return Err("comment or image is required".into());
         }
-        if let Some(media_data) = file_bytes {
+        form.com = form.com.map(encode_comment);
+
+        if let Some(media_data) = file {
             let MediaInfo {
                 media_name,
                 media_size,
@@ -424,16 +393,16 @@ async fn create_comment(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING *
             "#,
-            file_name,
+            form.file_name,
             media_name,
             thumb_name,
             media_size,
             thumb_size,
             media_ext,
-            create_comment.media_desc,
-            create_comment.alias,
-            create_comment.com,
-            create_comment.op,
+            form.media_desc,
+            form.alias,
+            form.com,
+            form.op,
         )
         .fetch_one(&*pool)
         .await.map_err(|e| e.into())
@@ -441,13 +410,13 @@ async fn create_comment(
             sqlx::query_as!(
                 Comment,
                 r#"
-            INSERT INTO comments (alias, com, op)
-            VALUES ($1, $2, $3)
-            RETURNING *
-            "#,
-                create_comment.alias,
-                create_comment.com,
-                create_comment.op,
+                INSERT INTO comments (alias, com, op)
+                VALUES ($1, $2, $3)
+                RETURNING *
+                "#,
+                form.alias,
+                form.com,
+                form.op,
             )
             .fetch_one(&*pool)
             .await
@@ -461,45 +430,27 @@ async fn create_comment(
 }
 
 async fn parse_multipart<T: DeserializeOwned>(mut multipart: Multipart) -> Res<MultiPartData<T>> {
-    let mut data: Option<T> = None;
-    let mut file_name: Option<String> = None;
-    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut form: Option<T> = None;
+    let mut file: Option<Vec<u8>> = None;
 
-    while let Some(mut field) = multipart.next_field().await.unwrap() {
+    while let Some(mut field) = multipart.next_field().await? {
         match field.name() {
             Some("data") => {
                 let text = field.text().await?;
-                data = Some(serde_json::from_str(&text)?);
+                form = Some(serde_json::from_str(&text)?);
             }
             Some("media") => {
-                let Some(file) = field.file_name() else {
-                    return Err("file namenot found".into());
-                };
-                file_name = Some(
-                    std::path::Path::new(file)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(file)
-                        .to_string(),
-                );
                 let mut chunks = Vec::new();
-                while let Ok(Some(chunk)) = field.chunk().await {
+                while let Some(chunk) = field.chunk().await? {
                     chunks.extend(chunk.to_vec());
                 }
-                file_bytes = Some(chunks);
+                file = Some(chunks);
             }
             _ => {}
         }
     }
-
-    let Some(data) = data else {
-        return Err("invalid data".into());
-    };
-    Ok(MultiPartData {
-        data,
-        file_name,
-        file_bytes,
-    })
+    let form = form.ok_or("data is required")?;
+    Ok(MultiPartData { form, file })
 }
 async fn save_media(media_data: Vec<u8>) -> Res<MediaInfo> {
     let uuid = Uuid::new_v4().to_string();
@@ -510,7 +461,7 @@ async fn save_media(media_data: Vec<u8>) -> Res<MediaInfo> {
     let mut thumb_data = Cursor::new(Vec::new());
     let thumb = create_thumbnails(
         Cursor::new(&media_data),
-        mime::Mime::from_str(media_kind.mime_type()).unwrap(),
+        mime::Mime::from_str(media_kind.mime_type())?,
         [ThumbnailSize::Medium],
     )?
     .pop()
@@ -565,6 +516,11 @@ fn encode_comment(com: impl AsRef<str>) -> String {
 fn encode_subject(sub: impl AsRef<str>) -> String {
     let sub = encode_comment(sub);
     format!("<b>{sub}</b>")
+}
+fn is_whitespace_empty(s: &str) -> Result<(), ValidationError> {
+    (!s.trim().is_empty())
+        .then_some(())
+        .ok_or(ValidationError::new("must not be empty"))
 }
 
 #[test]
