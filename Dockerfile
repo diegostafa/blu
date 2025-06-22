@@ -14,5 +14,6 @@ COPY . .
 
 ARG DATABASE_URL
 ENV DATABASE_URL=${DATABASE_URL}
+EXPOSE 3000
 
 CMD sqlx database create && sqlx migrate run && cargo run --release
