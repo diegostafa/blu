@@ -1,8 +1,8 @@
 use std::error::Error;
+use std::fs::DirBuilder;
 use std::io::Cursor;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, LazyLock};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path};
 use axum::http::{StatusCode, header};
@@ -21,16 +21,23 @@ use thumbnailer::{ThumbnailSize, create_thumbnails};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+static RE_REPLIES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"&gt;&gt;(\d+)").unwrap());
+static RE_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+")
+        .unwrap()
+});
 
 #[tokio::main]
 async fn main() -> Res<()> {
     let database_url = std::env::var("DATABASE_URL").expect("[error] DATABASE_URL is not set");
     let port = std::env::var("PORT").expect("[error] PORT is not set");
+    DirBuilder::new().create("media")?;
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -308,13 +315,11 @@ async fn create_thread(
     let create_thread_impl = async || -> Res<Comment> {
         let MultiPartData { mut form, file } = parse_multipart::<CreateThread>(multipart).await?;
         form.validate()?;
-        if form.sub.is_none() && form.com.is_none() {
-            return Err("subject or comment is required".into());
-        }
-        if form.sub.as_ref().unwrap().trim().is_empty()
-            && form.com.as_ref().unwrap().trim().is_empty()
-        {
-            return Err("subject and comment can't be empty".into());
+
+        let sub_empty = form.sub.as_ref().is_none_or(|s| s.trim().is_empty());
+        let com_empty = form.com.as_ref().is_none_or(|s| s.trim().is_empty());
+        if sub_empty && com_empty {
+            return Err("both subject and comment can't be empty".into());
         }
 
         form.sub = form.sub.map(encode_subject);
@@ -328,29 +333,28 @@ async fn create_thread(
             thumb_name,
             thumb_size,
         } = save_media(media_data).await?;
-        sqlx::query_as(
-        r#"
-        INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, sub, com, board, op)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        RETURNING *
-        "#)
-        .bind(form.file_name)
-        .bind(media_name)
-        .bind(thumb_name)
-        .bind(media_size)
-        .bind(thumb_size)
-        .bind(media_ext)
-        .bind(form.media_desc)
-        .bind(form.alias)
-        .bind(form.sub)
-        .bind(form.com)
-        .bind(form.board)
-        .bind(None::<i64>)
-    .fetch_one(&*pool)
-    .await.map_err(|e| e.into())
+        sqlx::query_as(r#"
+                INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, sub, com, board, op)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+            "#)
+            .bind(form.file_name)
+            .bind(media_name)
+            .bind(thumb_name)
+            .bind(media_size)
+            .bind(thumb_size)
+            .bind(media_ext)
+            .bind(form.media_desc)
+            .bind(form.alias)
+            .bind(form.sub)
+            .bind(form.com)
+            .bind(form.board)
+            .bind(None::<i64>)
+            .fetch_one(&*pool)
+            .await.map_err(|e| e.into())
     };
     match create_thread_impl().await {
-        Ok(res) => (StatusCode::OK, Json(Ok(res))),
+        Ok(res) => (StatusCode::CREATED, Json(Ok(res))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(Err(e.to_string()))),
     }
 }
@@ -374,25 +378,24 @@ async fn create_comment(
                 thumb_name,
                 thumb_size,
             } = save_media(media_data).await?;
-            sqlx::query_as(
-            r#"
-            INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, com, op)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING *
-            "#
-        )
-.bind(form.file_name)
-.bind(media_name)
-.bind(thumb_name)
-.bind(media_size)
-.bind(thumb_size)
-.bind(media_ext)
-.bind(form.media_desc)
-.bind(form.alias)
-.bind(form.com)
-.bind(form.op)
-        .fetch_one(&*pool)
-        .await.map_err(|e| e.into())
+            sqlx::query_as(r#"
+                INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, com, op)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING *
+                "#
+            )
+            .bind(form.file_name)
+            .bind(media_name)
+            .bind(thumb_name)
+            .bind(media_size)
+            .bind(thumb_size)
+            .bind(media_ext)
+            .bind(form.media_desc)
+            .bind(form.alias)
+            .bind(form.com)
+            .bind(form.op)
+            .fetch_one(&*pool)
+            .await.map_err(|e| e.into())
         } else {
             sqlx::query_as(
                 r#"
@@ -428,21 +431,21 @@ async fn parse_multipart<T: DeserializeOwned>(mut multipart: Multipart) -> Res<M
             Some("media") => {
                 let mut chunks = Vec::new();
                 while let Some(chunk) = field.chunk().await? {
-                    chunks.extend(chunk.to_vec());
+                    chunks.extend_from_slice(&chunk);
                 }
                 file = Some(chunks);
             }
             _ => {}
         }
     }
-    let form = form.ok_or("data is required")?;
+    let form = form.ok_or("data field is required")?;
     Ok(MultiPartData { form, file })
 }
 async fn save_media(media_data: Vec<u8>) -> Res<MediaInfo> {
-    let tstamp = Instant::now().elapsed().as_nanos().to_string();
+    let uuid = Uuid::new_v4().to_string();
     let media_kind = infer::get(&media_data).ok_or("Failed to infer media type")?;
-    let media_name = tstamp.clone();
-    let thumb_name = tstamp + "t";
+    let media_name = uuid.clone();
+    let thumb_name = uuid + "t";
 
     let mut thumb_data = Cursor::new(Vec::new());
     let thumb = create_thumbnails(
@@ -477,12 +480,6 @@ async fn save_media(media_data: Vec<u8>) -> Res<MediaInfo> {
 }
 
 fn encode_comment(com: impl AsRef<str>) -> String {
-    let re_replies = Regex::new(r"&gt;&gt;(\d+)").unwrap();
-    let re_url = Regex::new(
-        r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
-    )
-    .unwrap();
-
     let text = encode_text(&com);
     let text = text
         .lines()
@@ -495,8 +492,8 @@ fn encode_comment(com: impl AsRef<str>) -> String {
         })
         .collect::<Vec<_>>()
         .join("<br>");
-    let text = re_url.replace_all(&text, "<a href=\"$0\">$0</a>");
-    let text = re_replies.replace_all(&text, "<a href=\"#p$1\">&gt;&gt;$1</a>");
+    let text = RE_URL.replace_all(&text, "<a href=\"$0\">$0</a>");
+    let text = RE_REPLIES.replace_all(&text, "<a href=\"#p$1\">&gt;&gt;$1</a>");
     text.to_string()
 }
 fn encode_subject(sub: impl AsRef<str>) -> String {
