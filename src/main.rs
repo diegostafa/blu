@@ -37,7 +37,7 @@ static RE_URL: LazyLock<Regex> = LazyLock::new(|| {
 async fn main() -> Res<()> {
     let database_url = std::env::var("DATABASE_URL").expect("[error] DATABASE_URL is not set");
     let port = std::env::var("PORT").expect("[error] PORT is not set");
-    DirBuilder::new().create("media")?;
+    DirBuilder::new().recursive(true).create("media")?;
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
