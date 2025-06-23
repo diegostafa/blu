@@ -205,14 +205,10 @@ async fn get_media(Path(file): Path<String>) -> impl IntoResponse {
 }
 async fn get_boards(Extension(pool): Extension<Arc<SqlitePool>>) -> impl IntoResponse {
     let get_boards_impl = async || -> Res<Vec<Board>> {
-        sqlx::query_as(
-            r#"
-            SELECT * FROM boards
-            "#,
-        )
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| e.into())
+        sqlx::query_as(r#"SELECT * FROM boards"#)
+            .fetch_all(&*pool)
+            .await
+            .map_err(|e| e.into())
     };
     match get_boards_impl().await {
         Ok(res) => (StatusCode::OK, Json(Ok(res))),
@@ -263,16 +259,13 @@ async fn get_comments(
 ) -> impl IntoResponse {
     let get_comments_impl = async || -> Res<Vec<Comment>> {
         let thread_id = Some(thread_id);
-        sqlx::query_as(
-            r#"
-            SELECT * FROM comments WHERE board = $1 AND (id = $2 OR op = $2)
-            "#,
-        )
-        .bind(board_id)
-        .bind(thread_id)
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| e.into())
+        sqlx::query_as(r#"SELECT * FROM comments WHERE board = ? AND (id = ? OR op = ?)"#)
+            .bind(board_id)
+            .bind(thread_id)
+            .bind(thread_id)
+            .fetch_all(&*pool)
+            .await
+            .map_err(|e| e.into())
     };
     match get_comments_impl().await {
         Ok(res) => (StatusCode::OK, Json(Ok(res))),
@@ -292,8 +285,8 @@ async fn create_board(
             RETURNING *
             "#,
         )
-        .bind(form.name)
         .bind(form.code)
+        .bind(form.name)
         .bind(form.desc)
         .bind(form.max_threads)
         .bind(form.max_replies)
