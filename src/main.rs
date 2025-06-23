@@ -2,6 +2,7 @@ use std::error::Error;
 use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path};
 use axum::http::{StatusCode, header};
@@ -13,30 +14,26 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use sqlx::prelude::FromRow;
 use sqlx::sqlite::SqlitePoolOptions;
 use thumbnailer::{ThumbnailSize, create_thumbnails};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::trace::TraceLayer;
-use uuid::Uuid;
 use validator::{Validate, ValidationError};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
 #[tokio::main]
 async fn main() -> Res<()> {
-    dotenvy::dotenv().ok();
+    let database_url = std::env::var("DATABASE_URL")?;
+    let port = std::env::var("PORT")?;
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let db_url = std::env::var("DATABASE_URL")?;
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await?;
-    let pool = Arc::new(pool);
-
+    let pool = Arc::new(SqlitePoolOptions::new().connect(&database_url).await?);
     let app = Router::new()
         .route("/boards", get(get_boards))
         .route("/{board_id}", get(get_threads))
@@ -49,11 +46,11 @@ async fn main() -> Res<()> {
         .layer(Extension(pool.clone()))
         .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     axum::serve(listener, app).await.map_err(|e| e.into())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 struct Board {
     code: String,
     name: String,
@@ -67,7 +64,7 @@ struct Board {
     is_nsfw: bool,
     created_at: i64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 struct Thread {
     id: i64,
     file_name: Option<String>,
@@ -84,7 +81,7 @@ struct Thread {
     replies: i64,
     images: i64,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, FromRow)]
 struct Comment {
     id: i64,
     alias: Option<String>,
@@ -203,8 +200,7 @@ async fn get_media(Path(file): Path<String>) -> impl IntoResponse {
 }
 async fn get_boards(Extension(pool): Extension<Arc<SqlitePool>>) -> impl IntoResponse {
     let get_boards_impl = async || -> Res<Vec<Board>> {
-        sqlx::query_as!(
-            Board,
+        sqlx::query_as(
             r#"
             SELECT * FROM boards
             "#,
@@ -223,8 +219,7 @@ async fn get_threads(
     Extension(pool): Extension<Arc<SqlitePool>>,
 ) -> impl IntoResponse {
     let get_threads_impl = async || -> Res<Vec<Thread>> {
-        sqlx::query_as!(
-            Thread,
+        sqlx::query_as(
             r#"
             SELECT
             c.id AS id,
@@ -243,11 +238,11 @@ async fn get_threads(
             COUNT(r.media_name) AS images
             FROM comments c
             LEFT JOIN comments r ON r.op = c.id
-            WHERE c.op IS NULL AND c.board = $1
+            WHERE c.op IS NULL AND c.board = ?
             GROUP BY c.id
             "#,
-            board_id,
         )
+        .bind(board_id)
         .fetch_all(&*pool)
         .await
         .map_err(|e| e.into())
@@ -263,14 +258,13 @@ async fn get_comments(
 ) -> impl IntoResponse {
     let get_comments_impl = async || -> Res<Vec<Comment>> {
         let thread_id = Some(thread_id);
-        sqlx::query_as!(
-            Comment,
+        sqlx::query_as(
             r#"
             SELECT * FROM comments WHERE board = $1 AND (id = $2 OR op = $2)
             "#,
-            board_id,
-            thread_id,
         )
+        .bind(board_id)
+        .bind(thread_id)
         .fetch_all(&*pool)
         .await
         .map_err(|e| e.into())
@@ -286,23 +280,23 @@ async fn create_board(
 ) -> impl IntoResponse {
     let create_board_impl = async || -> Res<Board> {
         form.validate()?;
-        sqlx::query_as!(Board,
+        sqlx::query_as(
             r#"
             INSERT INTO boards (code, name, desc, max_threads, max_replies, max_img_replies, max_sub_len, max_com_len, max_file_size, is_nsfw)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
             "#,
-            form.code,
-            form.name,
-            form.desc,
-            form.max_threads,
-            form.max_replies,
-            form.max_img_replies,
-            form.max_sub_len,
-            form.max_com_len,
-            form.max_file_size,
-            form.is_nsfw
         )
+        .bind(form.name)
+        .bind(form.code)
+        .bind(form.desc)
+        .bind(form.max_threads)
+        .bind(form.max_replies)
+        .bind(form.max_img_replies)
+        .bind(form.max_sub_len)
+        .bind(form.max_com_len)
+        .bind(form.max_file_size)
+        .bind(form.is_nsfw)
         .fetch_one(&*pool)
         .await.map_err(|e| e.into())
     };
@@ -325,11 +319,6 @@ async fn create_thread(
         form.sub = form.sub.map(encode_subject);
         form.com = form.com.map(encode_comment);
 
-        sqlx::query_as!(Board, r#"SELECT * FROM boards WHERE code = $1"#, form.board,)
-            .fetch_one(&*pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
         let media_data = file.ok_or("media is required")?;
         let MediaInfo {
             media_name,
@@ -338,26 +327,24 @@ async fn create_thread(
             thumb_name,
             thumb_size,
         } = save_media(media_data).await?;
-        sqlx::query_as!(
-        Comment,
+        sqlx::query_as(
         r#"
         INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, sub, com, board, op)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
-        "#,
-        form.file_name,
-        media_name,
-        thumb_name,
-        media_size,
-        thumb_size,
-        media_ext,
-        form.media_desc,
-        form.alias,
-        form.sub,
-        form.com,
-        form.board,
-        None::<i64>,
-    )
+        "#)
+        .bind(form.file_name)
+        .bind(media_name)
+        .bind(thumb_name)
+        .bind(media_size)
+        .bind(thumb_size)
+        .bind(media_ext)
+        .bind(form.media_desc)
+        .bind(form.alias)
+        .bind(form.sub)
+        .bind(form.com)
+        .bind(form.board)
+        .bind(None::<i64>)
     .fetch_one(&*pool)
     .await.map_err(|e| e.into())
     };
@@ -386,38 +373,36 @@ async fn create_comment(
                 thumb_name,
                 thumb_size,
             } = save_media(media_data).await?;
-            sqlx::query_as!(
-            Comment,
+            sqlx::query_as(
             r#"
             INSERT INTO comments (file_name, media_name, thumb_name, media_size, thumb_size, media_ext, media_desc, alias, com, op)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING *
-            "#,
-            form.file_name,
-            media_name,
-            thumb_name,
-            media_size,
-            thumb_size,
-            media_ext,
-            form.media_desc,
-            form.alias,
-            form.com,
-            form.op,
+            "#
         )
+.bind(form.file_name)
+.bind(media_name)
+.bind(thumb_name)
+.bind(media_size)
+.bind(thumb_size)
+.bind(media_ext)
+.bind(form.media_desc)
+.bind(form.alias)
+.bind(form.com)
+.bind(form.op)
         .fetch_one(&*pool)
         .await.map_err(|e| e.into())
         } else {
-            sqlx::query_as!(
-                Comment,
+            sqlx::query_as(
                 r#"
                 INSERT INTO comments (alias, com, op)
-                VALUES ($1, $2, $3)
+                VALUES (?, ?, ?)
                 RETURNING *
                 "#,
-                form.alias,
-                form.com,
-                form.op,
             )
+            .bind(form.alias)
+            .bind(form.com)
+            .bind(form.op)
             .fetch_one(&*pool)
             .await
             .map_err(|e| e.into())
@@ -453,10 +438,10 @@ async fn parse_multipart<T: DeserializeOwned>(mut multipart: Multipart) -> Res<M
     Ok(MultiPartData { form, file })
 }
 async fn save_media(media_data: Vec<u8>) -> Res<MediaInfo> {
-    let uuid = Uuid::new_v4().to_string();
+    let tstamp = Instant::now().elapsed().as_nanos().to_string();
     let media_kind = infer::get(&media_data).ok_or("Failed to infer media type")?;
-    let media_name = uuid.clone();
-    let thumb_name = format!("{uuid}t");
+    let media_name = tstamp.clone();
+    let thumb_name = tstamp + "t";
 
     let mut thumb_data = Cursor::new(Vec::new());
     let thumb = create_thumbnails(
