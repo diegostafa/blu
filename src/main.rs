@@ -14,6 +14,7 @@ use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use sqlx::migrate::Migrator;
 use sqlx::prelude::FromRow;
 use sqlx::sqlite::SqlitePoolOptions;
 use thumbnailer::{ThumbnailSize, create_thumbnails};
@@ -24,16 +25,20 @@ use validator::{Validate, ValidationError};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
 #[tokio::main]
 async fn main() -> Res<()> {
-    let database_url = std::env::var("DATABASE_URL")?;
-    let port = std::env::var("PORT")?;
+    let database_url = std::env::var("DATABASE_URL").expect("[error] DATABASE_URL is not set");
+    let port = std::env::var("PORT").expect("[error] PORT is not set");
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let pool = Arc::new(SqlitePoolOptions::new().connect(&database_url).await?);
+    MIGRATOR.run(&*pool).await?;
+
     let app = Router::new()
         .route("/boards", get(get_boards))
         .route("/{board_id}", get(get_threads))

@@ -1,6 +1,7 @@
 /target
 /*.db
 /media
+/db
 
 *.db-shm
 *.db-wal
