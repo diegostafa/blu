@@ -141,10 +141,7 @@ struct CreateThread {
     #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
     alias: Option<String>,
 
-    #[validate(length(min = 1), custom(function = "is_whitespace_empty"))]
     sub: Option<String>,
-
-    #[validate(length(min = 1), custom(function = "is_whitespace_empty"))]
     com: Option<String>,
 
     #[validate(length(min = 1, max = 255), custom(function = "is_whitespace_empty"))]
@@ -314,6 +311,12 @@ async fn create_thread(
         if form.sub.is_none() && form.com.is_none() {
             return Err("subject or comment is required".into());
         }
+        if form.sub.as_ref().unwrap().trim().is_empty()
+            && form.com.as_ref().unwrap().trim().is_empty()
+        {
+            return Err("subject and comment can't be empty".into());
+        }
+
         form.sub = form.sub.map(encode_subject);
         form.com = form.com.map(encode_comment);
 
